@@ -30,6 +30,12 @@ contract VaultHandler is Test {
     mapping(address => uint256) public inflows;
     mapping(address => uint256) public outflows;
     mapping(bytes4 => uint256) public calls;
+    // Independent model: update from successful action inputs, never by copying balanceOf.
+    mapping(bytes32 => mapping(address => uint256)) public expectedAvailable;
+    mapping(bytes32 => mapping(address => uint256)) public expectedLocked;
+    mapping(address => uint256) public donations;
+    mapping(bytes32 => NightshiftVault.Game) private _expectedGames;
+    mapping(bytes32 => uint256) public expectedOwnerNonce;
 
     constructor(NightshiftVault vault_, address[3] memory owners_) {
         vault = vault_;
@@ -52,6 +58,7 @@ contract VaultHandler is Test {
             vault.deposit(id, asset, amount);
         }
         inflows[asset] += amount;
+        expectedAvailable[id][asset] += amount;
         ++calls[this.deposit.selector];
     }
 
@@ -69,6 +76,7 @@ contract VaultHandler is Test {
         }
         vault.sweep(id, asset);
         inflows[asset] += amount;
+        expectedAvailable[id][asset] += amount;
         ++calls[this.sweep.selector];
     }
 
@@ -81,6 +89,7 @@ contract VaultHandler is Test {
         vm.prank(_owners[account]);
         vault.withdraw(_accounts[account], asset, amount);
         outflows[asset] += amount;
+        expectedAvailable[_accounts[account]][asset] -= amount;
         ++calls[this.withdraw.selector];
     }
 
@@ -97,16 +106,27 @@ contract VaultHandler is Test {
         _gameIds.push(id);
         vm.prank(_operator);
         vault.lockGame(id, a, b, asset, stake, vm.getBlockTimestamp() + 1 hours);
+        expectedAvailable[a][asset] -= stake;
+        expectedAvailable[b][asset] -= stake;
+        expectedLocked[a][asset] += stake;
+        expectedLocked[b][asset] += stake;
+        _expectedGames[id] = NightshiftVault.Game(
+            a, b, asset, stake, vm.getBlockTimestamp() + 1 hours, NightshiftVault.GameStatus.Locked, 0
+        );
         ++calls[this.lock.selector];
     }
 
     function settleOrRefund(uint256 index, uint8 result) external {
         if (_gameIds.length == 0) return;
         bytes32 id = _gameIds[index % _gameIds.length];
-        (,, address asset, uint256 stake, uint256 expiresAt, NightshiftVault.GameStatus status,) = vault.games(id);
-        if (status != NightshiftVault.GameStatus.Locked) return;
-        if (vm.getBlockTimestamp() >= expiresAt + 24 hours) {
+        NightshiftVault.Game storage game = _expectedGames[id];
+        if (game.status != NightshiftVault.GameStatus.Locked) return;
+        address asset = game.asset;
+        uint256 stake = game.stake;
+        if (vm.getBlockTimestamp() >= game.expiresAt + 24 hours) {
             vault.refundGame(id);
+            game.status = NightshiftVault.GameStatus.Refunded;
+            result = 2;
         } else {
             result %= 3;
             uint256 deadline = vm.getBlockTimestamp();
@@ -119,7 +139,17 @@ contract VaultHandler is Test {
             );
             (uint8 v, bytes32 r, bytes32 s) = vm.sign(RESULT_KEY, digest);
             vault.settle(id, result, deadline, abi.encodePacked(r, s, v));
+            game.status = NightshiftVault.GameStatus.Settled;
+            game.result = result;
             if (result != 2) outflows[asset] += 2 * stake / 20;
+        }
+        expectedLocked[game.accountA][asset] -= stake;
+        expectedLocked[game.accountB][asset] -= stake;
+        if (result == 2) {
+            expectedAvailable[game.accountA][asset] += stake;
+            expectedAvailable[game.accountB][asset] += stake;
+        } else {
+            expectedAvailable[result == 0 ? game.accountA : game.accountB][asset] += 2 * stake - 2 * stake / 20;
         }
         ++calls[this.settleOrRefund.selector];
     }
@@ -136,6 +166,7 @@ contract VaultHandler is Test {
         uint256 amount = bound(raw, 1, available / 2) * 2;
         vm.prank(operatorPurchase ? _operator : _owners[account]);
         vault.buy(id, keccak256("item"), asset, amount);
+        expectedAvailable[id][asset] -= amount;
         if (asset != address(0)) outflows[asset] += amount / 2;
         ++calls[this.buy.selector];
     }
@@ -179,6 +210,7 @@ contract VaultHandler is Test {
             vault.expirePrizes(prize.epoch, prize.asset);
         } else if (remaining != 0) {
             vault.claimPrize(prize.epoch, prize.accountId, prize.asset, prize.amount, new bytes32[](0));
+            expectedAvailable[prize.accountId][prize.asset] += prize.amount;
         }
         ++calls[this.claimOrExpire.selector];
     }
@@ -220,6 +252,60 @@ contract VaultHandler is Test {
         vm.prank(vault.OWNER());
         vault.setPaused(value);
         ++calls[this.pause.selector];
+    }
+
+    /// @dev Models unsolicited tokens and forced ETH without minting any player entitlement.
+    function donate(uint8 assetIndex, uint96 raw) external {
+        address asset = _assets[assetIndex % 3];
+        uint256 amount = bound(raw, 1, 1 ether);
+        if (asset == address(0)) vm.deal(address(vault), address(vault).balance + amount);
+        else MockToken(asset).mint(address(vault), amount);
+        donations[asset] += amount;
+        inflows[asset] += amount;
+        ++calls[this.donate.selector];
+    }
+
+    /// @dev Alternate distinct owners for each account; all subsequent owner calls use the successor.
+    function rotateOwner(uint8 accountIndex, bool secondary) external {
+        uint256 account = accountIndex % 3;
+        uint256[3] memory primaryKeys = [uint256(0xa11ce), uint256(0xb0b), uint256(0xca401)];
+        uint256 newKey = primaryKeys[account] + (secondary ? 1_000_000 : 0);
+        address newOwner = vm.addr(newKey);
+        if (newOwner == _owners[account]) return;
+        bytes32 id = _accounts[account];
+        uint256 deadline = vm.getBlockTimestamp();
+        bytes32 digest = keccak256(
+            abi.encodePacked(
+                "\x19\x01",
+                vault.DOMAIN_SEPARATOR(),
+                keccak256(
+                    abi.encode(vault.OWNER_TYPEHASH(), id, _owners[account], newOwner, expectedOwnerNonce[id], deadline)
+                )
+            )
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(newKey, digest);
+        vm.prank(_owners[account]);
+        vault.setOwner(id, newOwner, deadline, abi.encodePacked(r, s, v));
+        _owners[account] = newOwner;
+        ++expectedOwnerNonce[id];
+        ++calls[this.rotateOwner.selector];
+    }
+
+    /// @dev Adversarial action: the payer/handler is never an account owner or operational role.
+    function unauthorizedWithdraw(uint8 accountIndex, uint8 assetIndex, uint96 raw) external {
+        bytes32 id = _accounts[accountIndex % 3];
+        address asset = _assets[assetIndex % 3];
+        vm.expectRevert(NightshiftVault.Unauthorized.selector);
+        vault.withdraw(id, asset, bound(raw, 1, 1 ether));
+        ++calls[this.unauthorizedWithdraw.selector];
+    }
+
+    function expectedOwner(uint256 index) external view returns (address) {
+        return _owners[index];
+    }
+
+    function expectedGame(bytes32 id) external view returns (NightshiftVault.Game memory) {
+        return _expectedGames[id];
     }
 
     function gameCount() external view returns (uint256) {
@@ -264,7 +350,7 @@ contract VaultInvariantTest is VaultTestBase {
         super.setUp();
         handler = new VaultHandler(vault, [alice, bob, carol]);
         vm.deal(address(handler), 1_000_000 ether);
-        bytes4[] memory selectors = new bytes4[](14);
+        bytes4[] memory selectors = new bytes4[](17);
         selectors[0] = handler.deposit.selector;
         selectors[1] = handler.sweep.selector;
         selectors[2] = handler.withdraw.selector;
@@ -279,6 +365,9 @@ contract VaultInvariantTest is VaultTestBase {
         selectors[11] = handler.freeze.selector;
         selectors[12] = handler.setCaps.selector;
         selectors[13] = handler.pause.selector;
+        selectors[14] = handler.donate.selector;
+        selectors[15] = handler.rotateOwner.selector;
+        selectors[16] = handler.unauthorizedWithdraw.selector;
         targetSelector(FuzzSelector(address(handler), selectors));
         targetContract(address(handler));
     }
@@ -288,8 +377,47 @@ contract VaultInvariantTest is VaultTestBase {
         for (uint256 i; i < 3; ++i) {
             address asset = assets[i];
             uint256 holdings = _balance(address(vault), asset);
-            assertEq(vault.accountedHoldings(asset), holdings, "unaccounted funds");
+            assertEq(vault.accountedHoldings(asset) + handler.donations(asset), holdings, "unallocated donation ledger");
             assertEq(holdings + handler.outflows(asset), handler.inflows(asset), "external conservation");
+        }
+    }
+
+    /// @dev Required by custody rules: all individual entitlements follow only the authorized actions.
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 96
+    function invariant_eachAccountMatchesIndependentActionLedger() public view {
+        bytes32[3] memory accounts = [A, B, C];
+        for (uint256 a; a < 3; ++a) {
+            assertEq(vault.accountOf(accounts[a]), handler.expectedOwner(a), "owner model");
+            assertEq(vault.ownerNonces(accounts[a]), handler.expectedOwnerNonce(accounts[a]), "owner nonce model");
+            for (uint256 t; t < 3; ++t) {
+                assertEq(
+                    _available(accounts[a], assets[t]),
+                    handler.expectedAvailable(accounts[a], assets[t]),
+                    "available model"
+                );
+                assertEq(
+                    _locked(accounts[a], assets[t]), handler.expectedLocked(accounts[a], assets[t]), "locked model"
+                );
+            }
+        }
+        for (uint256 i; i < handler.gameCount(); ++i) {
+            bytes32 id = handler.gameId(i);
+            NightshiftVault.Game memory expected = handler.expectedGame(id);
+            (
+                bytes32 a,
+                bytes32 b,
+                address asset,
+                uint256 stake,
+                uint256 expiry,
+                NightshiftVault.GameStatus status,
+                uint8 result
+            ) = vault.games(id);
+            assertEq(
+                keccak256(abi.encode(a, b, asset, stake, expiry, status, result)),
+                keccak256(abi.encode(expected)),
+                "game model"
+            );
         }
     }
 
@@ -334,6 +462,8 @@ contract VaultInvariantTest is VaultTestBase {
         handler.deposit(0, 0, 1 ether);
         handler.deposit(1, 0, 1 ether);
         handler.lock(0, 0, 0.01 ether);
+        handler.rotateOwner(0, true);
+        handler.unauthorizedWithdraw(0, 0, 1);
         handler.settleOrRefund(0, 0);
         handler.sweep(2, 1, 1 ether);
         handler.buy(2, 1, 0.1 ether, true);
@@ -347,9 +477,14 @@ contract VaultInvariantTest is VaultTestBase {
         handler.claimOrExpire(1);
         handler.buyDirect(0, 0, 1 ether);
         handler.burn(1 ether);
+        handler.donate(0, 11);
+        handler.donate(1, 13);
+        handler.donate(2, 17);
+        handler.withdraw(0, 0, 1);
         invariant_allLiabilitiesBackedAndExternalFlowsConserved();
         invariant_lockedBalancesEqualAllLiveGameStakes();
         invariant_epochReservationsEqualUnclaimedPrizes();
+        invariant_eachAccountMatchesIndependentActionLedger();
         assertGt(handler.calls(handler.lock.selector), 0);
         assertGt(handler.calls(handler.claimOrExpire.selector), 0);
         assertGt(handler.calls(handler.burn.selector), 0);
