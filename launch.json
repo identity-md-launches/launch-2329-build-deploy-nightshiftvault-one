@@ -1,0 +1,10 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "NightshiftVault",
+      "constructorArgs": []
+    }
+  ],
+  "notes": "NightshiftVault (src/NightshiftVault.sol) is the only application contract: NIGHTSHIFT player custody for native ETH, IMD 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7 and SHIFT 0xe5e58e53d0bb204aa62c995a6c8cc8a48e60c3ac, with per-account CREATE2 deposit forwarders, operator-locked staked games settled by EIP-712 result signatures (95% to the winner, 5% to the fee splitter 0x1119d5df2f046bc2d3c0f6279ef2e9ce49422d44), the in-game shop with its fixed half burn / half prize-pot split (IMD half to BurnExecutor 0xe29386719c155b6847ad5a4e97c6674f10ffc750, SHIFT half to 0x000000000000000000000000000000000000dEaD, ETH half to the burn reserve bought into SHIFT on the Uniswap v4 ETH/SHIFT pool by the keeper), rolling 24 h stake caps, account freezes, weekly Merkle prize epochs, and 48 h delayed role changes. The constructor takes no arguments and makes no external calls: the contract owner 0x6c4c78f2c3bdf4c4318fe305fb1c8bc1694d19b5, the initial operator / result signer / keeper 0x3b5919586fc04f7e99b450a72bcb14eeb6977497, the asset addresses, beneficiaries, pool key (fee 12500, tick spacing 60, hooks 0x42ebcf86e3ab0445ba0362f911a7e8fad6ace0cc) and default caps are compile-time constants, so msg.sender (the factory) and tx.origin never receive any privilege. EIP-712 domain is NightshiftVault / 1 bound to chain id 1 and the deployed address. DepositForwarder is deployed on demand by the vault itself via CREATE2 (salt = accountId) and is not a separate launch application. Deployment sends zero ETH and needs no initialization call; the contract owner may only pause new games, deposits and purchases and schedule role changes, and can never move player balances, the prize pot or the burn reserve."
+}
